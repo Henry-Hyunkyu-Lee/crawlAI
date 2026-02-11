@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from string import Formatter
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,21 +10,14 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from updater import ReleaseInfo, check_for_update, launch_update_script, read_update_status
-
-PROMPT_TEMPLATE = (
-    "다음 정보를 바탕으로 웹검색을 수행해 해당 인물의 공식 이메일을 찾고, "
-    "정확도를 confidence_score(0~1)로 답해줘.\n"
-    "- feature_1: {feature_1}\n- feature_2: {feature_2}\n- feature_3: {feature_3}"
-)
 
 DEFAULT_OUTPUT = "results.csv"
 DEFAULT_HEAD_ROWS = 30
 DEFAULT_AUTOSAVE_EVERY = 20
 RESULT_COMPLETE_STATES = {"success", "error"}
-ALLOWED_PROMPT_FIELDS = {"feature_1", "feature_2", "feature_3"}
 
 SUPPORTED_PROVIDERS = ["openai", "gemini"]
 DEFAULT_PROVIDER = "openai"
@@ -32,10 +25,72 @@ DEFAULT_OPENAI_MODEL = "gpt-5-nano"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
+INPUT_FIELD_SPECS = [
+    {"key": "name", "label": "성명", "aliases": ["성명", "이름", "담당자", "name", "person"]},
+    {
+        "key": "company",
+        "label": "회사명",
+        "aliases": ["회사명", "기업명", "기관명", "소속", "organization", "company", "org"],
+    },
+    {
+        "key": "department",
+        "label": "부서명",
+        "aliases": ["부서명", "부서", "소속부서", "department", "dept"],
+    },
+    {
+        "key": "job_title",
+        "label": "직책명",
+        "aliases": ["직책명", "직급", "직위", "position", "title", "role"],
+    },
+    {
+        "key": "project",
+        "label": "과제명",
+        "aliases": ["과제명", "프로젝트명", "연구과제", "project", "task"],
+    },
+]
 
-class SearchResult(BaseModel):
-    email: str
-    confidence_score: float
+STANDARD_OUTPUT_COLUMNS = [
+    "성명",
+    "회사명",
+    "부서명",
+    "직책명",
+    "과제명",
+    "email",
+    "confidence_score",
+    "status",
+    "error_code",
+]
+REQUIRED_OUTPUT_COLUMNS = ["email", "confidence_score"]
+
+INPUT_KEY_TO_OUTPUT_LABEL = {
+    "name": "성명",
+    "company": "회사명",
+    "department": "부서명",
+    "job_title": "직책명",
+    "project": "과제명",
+}
+
+OUTPUT_COLUMN_TO_RESULT_KEY = {
+    "성명": "name",
+    "회사명": "company",
+    "부서명": "department",
+    "직책명": "job_title",
+    "과제명": "project",
+    "email": "email",
+    "confidence_score": "confidence_score",
+}
+
+PROMPT_INPUT_KEYS = ["name", "company", "department", "job_title", "project"]
+
+
+class StructuredSearchResult(BaseModel):
+    name: str = Field(default="")
+    company: str = Field(default="")
+    department: str = Field(default="")
+    job_title: str = Field(default="")
+    project: str = Field(default="")
+    email: str = Field(default="")
+    confidence_score: float = Field(default=0.0)
 
 
 def load_data(uploaded_file):
@@ -47,43 +102,58 @@ def load_data(uploaded_file):
     return pd.read_excel(uploaded_file)
 
 
+def normalize_header(text):
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", str(text or "").lower())
+
+
+def detect_column_by_alias(columns, aliases):
+    normalized_aliases = {normalize_header(alias) for alias in aliases}
+    for col in columns:
+        if normalize_header(col) in normalized_aliases:
+            return col
+    return None
+
+
+def normalize_structured_values(result: StructuredSearchResult):
+    data = result.model_dump()
+    normalized = {}
+    for key, value in data.items():
+        if key == "confidence_score":
+            normalized[key] = float(value)
+        else:
+            normalized[key] = str(value or "").strip()
+
+    score = normalized["confidence_score"]
+    if not 0 <= score <= 1:
+        raise ValueError("confidence_score는 0~1 범위여야 합니다.")
+    return normalized
+
+
 def ensure_result_columns(df):
-    if "Email" not in df.columns:
-        df["Email"] = ""
-    if "conf" not in df.columns:
-        df["conf"] = np.nan
-    if "status" not in df.columns:
-        df["status"] = ""
-    if "error_code" not in df.columns:
-        df["error_code"] = ""
-    return df
-
-
-def preprocess_df(df, feature_cols):
     df_out = df.copy()
-    if feature_cols:
-        df_out = df_out[feature_cols]
-        df_out = df_out.drop_duplicates(subset=feature_cols)
+
+    if "email" not in df_out.columns and "Email" in df_out.columns:
+        df_out["email"] = df_out["Email"]
+    if "confidence_score" not in df_out.columns and "conf" in df_out.columns:
+        df_out["confidence_score"] = df_out["conf"]
+
+    for col in ["성명", "회사명", "부서명", "직책명", "과제명", "email", "status", "error_code"]:
+        if col not in df_out.columns:
+            df_out[col] = ""
+
+    if "confidence_score" not in df_out.columns:
+        df_out["confidence_score"] = np.nan
+
     return df_out
 
 
-def validate_prompt_template(template):
-    fields = {
-        field_name
-        for _, field_name, _, _ in Formatter().parse(template)
-        if field_name is not None and field_name != ""
-    }
-    invalid_fields = sorted(fields - ALLOWED_PROMPT_FIELDS)
-    if invalid_fields:
-        raise ValueError(f"허용되지 않은 변수: {', '.join(invalid_fields)}")
-
-
-def build_prompt(template, name, org, extra):
-    return template.format(
-        feature_1=str(name) if pd.notna(name) else "N/A",
-        feature_2=str(org) if pd.notna(org) else "N/A",
-        feature_3=str(extra) if pd.notna(extra) else "N/A",
-    )
+def preprocess_df(df, dedupe_cols):
+    df_out = df.copy()
+    if dedupe_cols:
+        dedupe_cols = [c for c in dedupe_cols if c in df_out.columns]
+        if dedupe_cols:
+            df_out = df_out.drop_duplicates(subset=dedupe_cols)
+    return df_out
 
 
 def strip_code_fences(text):
@@ -94,7 +164,7 @@ def strip_code_fences(text):
     return cleaned.strip()
 
 
-def parse_search_result_text(raw_text):
+def parse_structured_result_text(raw_text):
     cleaned = strip_code_fences(raw_text)
     if not cleaned:
         raise ValueError("모델 응답이 비어 있습니다.")
@@ -105,13 +175,64 @@ def parse_search_result_text(raw_text):
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise ValueError("모델 응답에서 JSON을 찾을 수 없습니다.")
+            raise ValueError("모델 응답에서 JSON 객체를 찾을 수 없습니다.")
         payload = json.loads(cleaned[start : end + 1])
 
-    result = SearchResult.model_validate(payload)
-    if not 0 <= result.confidence_score <= 1:
-        raise ValueError("confidence_score는 0~1 범위여야 합니다.")
-    return result
+    result = StructuredSearchResult.model_validate(payload)
+    return normalize_structured_values(result)
+
+
+def build_response_contract(selected_output_columns):
+    response_keys = []
+    for col in selected_output_columns:
+        key = OUTPUT_COLUMN_TO_RESULT_KEY.get(col)
+        if key and key not in response_keys:
+            response_keys.append(key)
+    return response_keys
+
+
+def enforce_required_output_columns(columns):
+    selected = set(columns or [])
+    selected.update(REQUIRED_OUTPUT_COLUMNS)
+    # Keep a stable, predictable order for prompt/result handling.
+    return [c for c in STANDARD_OUTPUT_COLUMNS if c in selected]
+
+
+def build_json_contract_text(response_keys):
+    lines = ["{"]
+    for idx, key in enumerate(response_keys):
+        if key == "confidence_score":
+            value = "0.0"
+        else:
+            value = '""'
+        comma = "," if idx < len(response_keys) - 1 else ""
+        lines.append(f'  "{key}": {value}{comma}')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def build_task_prompt(payload, selected_output_columns):
+    response_keys = build_response_contract(selected_output_columns)
+    prompt_input_keys = [k for k in PROMPT_INPUT_KEYS if INPUT_KEY_TO_OUTPUT_LABEL[k] in selected_output_columns]
+
+    input_lines = []
+    for key in prompt_input_keys:
+        label = INPUT_KEY_TO_OUTPUT_LABEL[key]
+        input_lines.append(f"- {label}: {payload[key]}")
+
+    if not input_lines:
+        input_lines.append("- 입력 없음")
+
+    contract_text = build_json_contract_text(response_keys)
+    return (
+        "검색을 통해서 아래 정보를 완성하라.\n"
+        "아래 입력 항목만 활용하고, 입력에 없는 항목은 웹 검색으로 보완하라.\n"
+        "명시되지 않은 컬럼은 절대 반환하지 마라.\n"
+        "반드시 JSON 객체만 반환하라. 코드블록은 금지한다.\n"
+        f"{contract_text}\n"
+        "입력:\n"
+        + "\n".join(input_lines)
+    )
 
 
 def get_info_from_openai(client, prompt_text, model_name):
@@ -119,9 +240,9 @@ def get_info_from_openai(client, prompt_text, model_name):
         model=model_name,
         tools=[{"type": "web_search"}],
         input=prompt_text,
-        text_format=SearchResult,
+        text_format=StructuredSearchResult,
     )
-    return response.output_parsed
+    return normalize_structured_values(response.output_parsed)
 
 
 def extract_gemini_text(response_json):
@@ -144,11 +265,12 @@ def extract_gemini_text(response_json):
     raise ValueError(f"Gemini 텍스트 응답이 비어 있습니다. finishReason={finish_reason}")
 
 
-def get_info_from_gemini(api_key, prompt_text, model_name):
+def get_info_from_gemini(api_key, prompt_text, model_name, response_keys):
+    contract_text = build_json_contract_text(response_keys)
     instruction = (
         f"{prompt_text}\n\n"
         "반드시 아래 JSON 형식만 반환해. 코드블록 없이 JSON만 출력해.\n"
-        '{"email":"...","confidence_score":0.0}'
+        f"{contract_text}"
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": instruction}]}],
@@ -161,7 +283,7 @@ def get_info_from_gemini(api_key, prompt_text, model_name):
     response = requests.post(url, params={"key": api_key}, json=payload, timeout=90)
     response.raise_for_status()
     raw_text = extract_gemini_text(response.json())
-    return parse_search_result_text(raw_text)
+    return parse_structured_result_text(raw_text)
 
 
 def resolve_api_key(input_key, provider):
@@ -217,19 +339,45 @@ def merge_partial_results(subset, partial_df):
     if "_row_index" not in partial_df.columns:
         raise ValueError("partial 파일 형식이 올바르지 않습니다. (_row_index 누락)")
 
-    merge_cols = ["_row_index", "Email", "conf", "status", "error_code"]
+    merge_cols = ["_row_index"] + STANDARD_OUTPUT_COLUMNS
     partial_compact = (
         partial_df[merge_cols].drop_duplicates(subset=["_row_index"], keep="last")
     )
 
-    base_cols = [
-        c for c in subset.columns if c not in ["Email", "conf", "status", "error_code"]
-    ]
+    base_cols = [c for c in subset.columns if c not in STANDARD_OUTPUT_COLUMNS]
     merged = subset[base_cols].merge(partial_compact, on="_row_index", how="left")
     merged = ensure_result_columns(merged)
-    merged["Email"] = merged["Email"].fillna("")
-    merged["status"] = merged["status"].fillna("")
-    merged["error_code"] = merged["error_code"].fillna("")
+    for col in ["성명", "회사명", "부서명", "직책명", "과제명", "email", "status", "error_code"]:
+        merged[col] = merged[col].fillna("")
+    return merged
+
+
+def get_mapping_from_state():
+    mapping = {}
+    for spec in INPUT_FIELD_SPECS:
+        raw_val = st.session_state.get(f"map_{spec['key']}_col")
+        mapping[spec["key"]] = None if raw_val in (None, "(없음)") else raw_val
+    return mapping
+
+
+def extract_input_payload(row, mapping):
+    payload = {}
+    for spec in INPUT_FIELD_SPECS:
+        key = spec["key"]
+        src_col = mapping.get(key)
+        if src_col and src_col in row.index and pd.notna(row[src_col]):
+            payload[key] = str(row[src_col]).strip()
+        else:
+            payload[key] = ""
+    return payload
+
+
+def merge_input_and_result(input_payload, result_payload):
+    merged = {}
+    for key in ["name", "company", "department", "job_title", "project"]:
+        merged[key] = input_payload[key] if input_payload[key] else result_payload.get(key, "")
+    merged["email"] = result_payload.get("email", "")
+    merged["confidence_score"] = result_payload.get("confidence_score", np.nan)
     return merged
 
 
@@ -240,11 +388,7 @@ def init_state():
         "start": 0,
         "end": 0,
         "output_name": DEFAULT_OUTPUT,
-        "name_col": None,
-        "org_col": None,
-        "extra_col": None,
-        "feature_cols": [],
-        "prompt_template": PROMPT_TEMPLATE,
+        "dedupe_cols": [],
         "run_requested": False,
         "run_confirmed": False,
         "done_text": "",
@@ -253,9 +397,13 @@ def init_state():
         "provider": DEFAULT_PROVIDER,
         "openai_model": DEFAULT_OPENAI_MODEL,
         "gemini_model": DEFAULT_GEMINI_MODEL,
+        "selected_output_columns": STANDARD_OUTPUT_COLUMNS.copy(),
         "update_repo": os.getenv("APP_REPO", "").strip(),
         "update_check_result": None,
     }
+    for spec in INPUT_FIELD_SPECS:
+        defaults[f"map_{spec['key']}_col"] = None
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -386,61 +534,48 @@ def main():
     columns_signature = tuple(columns)
     if st.session_state.get("columns_signature") != columns_signature:
         st.session_state.columns_signature = columns_signature
-        st.session_state.feature_cols = columns
-        st.session_state.name_col = None
-        st.session_state.org_col = None
-        st.session_state.extra_col = None
 
-    st.sidebar.subheader("전처리")
-    st.session_state.feature_cols = [
-        col for col in (st.session_state.feature_cols or []) if col in columns
-    ]
+        auto_mapped = []
+        for spec in INPUT_FIELD_SPECS:
+            detected = detect_column_by_alias(columns, spec["aliases"])
+            st.session_state[f"map_{spec['key']}_col"] = detected
+            if detected:
+                auto_mapped.append(detected)
+
+        st.session_state.dedupe_cols = list(dict.fromkeys(auto_mapped))
+
+    st.sidebar.subheader("입력 컬럼 설정")
+    for spec in INPUT_FIELD_SPECS:
+        key = spec["key"]
+        field_key = f"map_{key}_col"
+        options = ["(없음)"] + columns
+
+        current = st.session_state.get(field_key)
+        if current not in columns:
+            current = "(없음)"
+
+        st.sidebar.selectbox(
+            f"{spec['label']} 입력 컬럼",
+            options=options,
+            index=options.index(current),
+            key=field_key,
+        )
+
     st.sidebar.multiselect(
-        "피처 컬럼 선택",
+        "중복 제거 기준 컬럼",
         options=columns,
-        default=st.session_state.feature_cols,
-        key="feature_cols",
-        help="크롤링에 사용할 컬럼입니다.",
+        default=[c for c in st.session_state.dedupe_cols if c in columns],
+        key="dedupe_cols",
     )
 
-    param_options = st.session_state.feature_cols
-    if param_options:
-        name_options = param_options
-        org_options = param_options
+    mapping = get_mapping_from_state()
+    if mapping.get("company") is None:
+        st.warning("회사명 입력 컬럼을 설정해주세요. (회사명은 필수)")
+
+    if st.session_state.dedupe_cols:
+        df_processed = preprocess_df(df_raw, st.session_state.dedupe_cols)
     else:
-        name_options = ["(선택)"]
-        org_options = ["(선택)"]
-
-    st.session_state.name_col = st.sidebar.selectbox(
-        "feature_1 컬럼",
-        options=name_options,
-        index=name_options.index(st.session_state.name_col)
-        if st.session_state.name_col in name_options
-        else 0,
-    )
-    st.session_state.org_col = st.sidebar.selectbox(
-        "feature_2 컬럼",
-        options=org_options,
-        index=org_options.index(st.session_state.org_col)
-        if st.session_state.org_col in org_options
-        else 0,
-    )
-
-    extra_options = ["(없음)"] + param_options if param_options else ["(없음)"]
-    if st.session_state.extra_col in param_options:
-        extra_index = param_options.index(st.session_state.extra_col) + 1
-    else:
-        extra_index = 0
-    st.session_state.extra_col = st.sidebar.selectbox(
-        "feature_3 컬럼 (선택)",
-        options=extra_options,
-        index=extra_index,
-    )
-
-    if st.session_state.feature_cols:
-        df_processed = preprocess_df(df_raw, st.session_state.feature_cols)
-    else:
-        df_processed = df_raw.iloc[0:0]
+        df_processed = df_raw.copy()
 
     st.subheader("미리보기")
     preview_df = df_processed.head(st.session_state.head_rows)
@@ -453,9 +588,6 @@ def main():
         hide_index=True,
         height=preview_height,
     )
-
-    if not st.session_state.feature_cols:
-        st.warning("피처 컬럼을 선택해주세요.")
 
     st.sidebar.subheader("실행 옵션")
     st.session_state.start = st.sidebar.number_input(
@@ -470,6 +602,38 @@ def main():
     )
     st.session_state.output_name = st.sidebar.text_input(
         "출력 파일명", value=st.session_state.output_name
+    )
+
+    st.sidebar.multiselect(
+        "출력 컬럼 선택",
+        options=STANDARD_OUTPUT_COLUMNS,
+        default=[
+            c for c in st.session_state.selected_output_columns if c in STANDARD_OUTPUT_COLUMNS
+        ],
+        key="selected_output_columns",
+        help="선택에서 제외한 컬럼은 프롬프트/응답/저장에서 모두 제외됩니다.",
+    )
+
+    raw_selected_output_columns = [
+        c for c in st.session_state.selected_output_columns if c in STANDARD_OUTPUT_COLUMNS
+    ]
+    selected_output_columns = enforce_required_output_columns(raw_selected_output_columns)
+    if set(selected_output_columns) != set(raw_selected_output_columns):
+        st.sidebar.info("`email`, `confidence_score`는 필수 컬럼으로 자동 포함됩니다.")
+    selected_prompt_columns = [
+        c for c in selected_output_columns if c not in ("status", "error_code")
+    ]
+
+    sample_payload = {k: "" for k in PROMPT_INPUT_KEYS}
+    if len(df_processed) > 0:
+        sample_payload = extract_input_payload(df_processed.iloc[0], mapping)
+
+    prompt_preview = build_task_prompt(sample_payload, selected_prompt_columns)
+    st.sidebar.text_area(
+        "프롬프트(출력 컬럼 반영)",
+        value=prompt_preview,
+        height=220,
+        disabled=True,
     )
 
     st.session_state.provider = st.sidebar.selectbox(
@@ -512,24 +676,21 @@ def main():
         value=st.session_state.resume_from_partial,
         key="resume_from_partial",
     )
-    st.session_state.prompt_template = st.sidebar.text_area(
-        "프롬프트 템플릿",
-        value=st.session_state.prompt_template,
-        height=120,
-        help="사용 가능 변수: {feature_1}, {feature_2}, {feature_3}",
-    )
 
-    if st.sidebar.button("크롤링 실행", type="primary"):
+    if st.sidebar.button("프롬프트 태스크 시작", type="primary"):
         st.session_state.run_requested = True
         st.session_state.run_confirmed = False
         st.session_state.done_text = ""
 
     if st.session_state.run_requested:
-        try:
-            validate_prompt_template(st.session_state.prompt_template)
-        except ValueError as exc:
-            st.error(f"프롬프트 템플릿 오류: {exc}")
+        if not selected_output_columns:
+            st.error("최소 1개 이상의 출력 컬럼을 선택해주세요.")
             return
+        if not selected_prompt_columns:
+            st.error("status/error_code만 선택된 상태입니다. 추출할 출력 컬럼을 선택해주세요.")
+            return
+
+        response_keys = build_response_contract(selected_prompt_columns)
 
         provider = st.session_state.provider
         resolved_api_key = resolve_api_key(api_key, provider)
@@ -537,17 +698,8 @@ def main():
             st.error(f"API Key를 입력하거나 {env_hint} 환경변수를 설정해주세요.")
             return
 
-        if (
-            not st.session_state.name_col
-            or not st.session_state.org_col
-            or st.session_state.name_col == "(선택)"
-            or st.session_state.org_col == "(선택)"
-        ):
-            st.error("feature_1/feature_2 컬럼을 선택해주세요.")
-            return
-
-        if not st.session_state.feature_cols:
-            st.error("피처 컬럼을 선택해주세요.")
+        if ("회사명" in selected_prompt_columns) and mapping.get("company") is None:
+            st.error("회사명 입력 컬럼을 설정해주세요. (회사명은 필수)")
             return
 
         if not selected_model or not str(selected_model).strip():
@@ -593,6 +745,7 @@ def main():
         pending_subset = subset[~subset["status"].isin(RESULT_COMPLETE_STATES)].copy()
         if pending_subset.empty:
             final_df = subset.drop(columns=["_row_index"])
+            final_df = final_df[selected_output_columns]
             final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
             st.session_state.done_text = f"완료! 결과 저장: {output_path} (추가 처리 0행)"
             st.session_state.run_requested = False
@@ -610,38 +763,46 @@ def main():
         status = st.empty()
         status.info("처리 중...")
 
-        extra_col = st.session_state.extra_col if st.session_state.extra_col != "(없음)" else None
-
         autosave_every = int(st.session_state.autosave_every_n_rows)
         success_count = 0
         error_count = 0
         total_pending = len(pending_subset)
 
         for i, (_, row) in enumerate(pending_subset.iterrows(), start=1):
-            name_val = row[st.session_state.name_col]
-            org_val = row[st.session_state.org_col]
-            extra_val = row[extra_col] if extra_col and extra_col in subset.columns else "N/A"
             row_index = row["_row_index"]
             row_selector = subset["_row_index"] == row_index
+            input_payload = extract_input_payload(row, mapping)
 
             try:
-                prompt_text = build_prompt(
-                    st.session_state.prompt_template, name_val, org_val, extra_val
-                )
+                prompt_text = build_task_prompt(input_payload, selected_prompt_columns)
                 if provider == "openai":
-                    result = get_info_from_openai(client, prompt_text, selected_model)
+                    result_payload = get_info_from_openai(client, prompt_text, selected_model)
                 else:
-                    result = get_info_from_gemini(resolved_api_key, prompt_text, selected_model)
+                    result_payload = get_info_from_gemini(
+                        resolved_api_key, prompt_text, selected_model, response_keys
+                    )
 
-                subset.loc[row_selector, "Email"] = result.email
-                subset.loc[row_selector, "conf"] = result.confidence_score
+                merged = merge_input_and_result(input_payload, result_payload)
+
+                subset.loc[row_selector, "성명"] = merged["name"]
+                subset.loc[row_selector, "회사명"] = merged["company"]
+                subset.loc[row_selector, "부서명"] = merged["department"]
+                subset.loc[row_selector, "직책명"] = merged["job_title"]
+                subset.loc[row_selector, "과제명"] = merged["project"]
+                subset.loc[row_selector, "email"] = merged["email"]
+                subset.loc[row_selector, "confidence_score"] = merged["confidence_score"]
                 subset.loc[row_selector, "status"] = "success"
                 subset.loc[row_selector, "error_code"] = ""
                 success_count += 1
             except Exception as exc:
                 error_code = classify_error(exc)
-                subset.loc[row_selector, "Email"] = ""
-                subset.loc[row_selector, "conf"] = np.nan
+                subset.loc[row_selector, "성명"] = input_payload["name"]
+                subset.loc[row_selector, "회사명"] = input_payload["company"]
+                subset.loc[row_selector, "부서명"] = input_payload["department"]
+                subset.loc[row_selector, "직책명"] = input_payload["job_title"]
+                subset.loc[row_selector, "과제명"] = input_payload["project"]
+                subset.loc[row_selector, "email"] = ""
+                subset.loc[row_selector, "confidence_score"] = np.nan
                 subset.loc[row_selector, "status"] = "error"
                 subset.loc[row_selector, "error_code"] = error_code
                 error_count += 1
@@ -656,6 +817,8 @@ def main():
             progress.progress(i / total_pending)
 
         final_df = subset.drop(columns=["_row_index"])
+        final_df = ensure_result_columns(final_df)
+        final_df = final_df[selected_output_columns]
         final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
         if partial_path.exists():
