@@ -231,7 +231,30 @@ function Ensure-Dir {
     New-Item -ItemType Directory -Force -Path $PathValue | Out-Null
 }
 
+function Is-Excluded {
+    param(
+        [string]$RelativePath,
+        [string[]]$ExcludedTopDirs,
+        [string[]]$ExcludedFiles,
+        [string[]]$ExcludedGlobs
+    )
+
+    if (-not $RelativePath) { return $true }
+    $normalized = $RelativePath.Replace('/', '\\')
+    $firstSegment = $normalized.Split('\\')[0]
+
+    if ($ExcludedTopDirs -contains $firstSegment) { return $true }
+    if ($ExcludedFiles -contains $normalized) { return $true }
+
+    foreach ($pattern in $ExcludedGlobs) {
+        if ($normalized -like $pattern) { return $true }
+    }
+
+    return $false
+}
+
 $newFiles = New-Object System.Collections.Generic.List[string]
+$sourceRelativeSet = @{}
 
 try {
     Ensure-Dir -PathValue $TempDir
@@ -267,19 +290,22 @@ try {
 
     $excludedTopDirs = @(".git", ".venv", "__pycache__", ".update_runtime", ".update_backups")
     $excludedFiles = @(".env")
+    $excludedGlobs = @("*.csv", "*.xlsx", "*.xls", "*.parquet")
 
     $sourceFiles = Get-ChildItem -Path $sourceRoot -Recurse -File
     foreach ($src in $sourceFiles) {
         $relative = $src.FullName.Substring($sourceRoot.Length).TrimStart('\\','/')
         if (-not $relative) { continue }
 
-        $firstSegment = $relative.Split([char[]]"\\/")[0]
-        if ($excludedTopDirs -contains $firstSegment) { continue }
-        if ($excludedFiles -contains $relative) { continue }
+        $normalizedRelative = $relative.Replace('/', '\')
+        if (Is-Excluded -RelativePath $normalizedRelative -ExcludedTopDirs $excludedTopDirs -ExcludedFiles $excludedFiles -ExcludedGlobs $excludedGlobs) {
+            continue
+        }
+        $sourceRelativeSet[$normalizedRelative] = $true
 
-        $dest = Join-Path $WorkDir $relative
+        $dest = Join-Path $WorkDir $normalizedRelative
         if (Test-Path $dest) {
-            $backupFile = Join-Path $BackupDir $relative
+            $backupFile = Join-Path $BackupDir $normalizedRelative
             Ensure-Dir -PathValue (Split-Path $backupFile -Parent)
             Copy-Item -Path $dest -Destination $backupFile -Force
         }
@@ -289,6 +315,26 @@ try {
 
         Ensure-Dir -PathValue (Split-Path $dest -Parent)
         Copy-Item -Path $src.FullName -Destination $dest -Force
+    }
+
+    # Delete stale files that are not present in the new release.
+    $workFiles = Get-ChildItem -Path $WorkDir -Recurse -File
+    foreach ($wf in $workFiles) {
+        $relative = $wf.FullName.Substring($WorkDir.Length).TrimStart('\\','/')
+        if (-not $relative) { continue }
+
+        $normalizedRelative = $relative.Replace('/', '\')
+        if (Is-Excluded -RelativePath $normalizedRelative -ExcludedTopDirs $excludedTopDirs -ExcludedFiles $excludedFiles -ExcludedGlobs $excludedGlobs) {
+            continue
+        }
+        if ($sourceRelativeSet.ContainsKey($normalizedRelative)) {
+            continue
+        }
+
+        $backupFile = Join-Path $BackupDir $normalizedRelative
+        Ensure-Dir -PathValue (Split-Path $backupFile -Parent)
+        Copy-Item -Path $wf.FullName -Destination $backupFile -Force
+        Remove-Item -Path $wf.FullName -Force -ErrorAction Stop
     }
 
     Push-Location $WorkDir
