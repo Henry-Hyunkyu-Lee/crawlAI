@@ -61,6 +61,19 @@ STANDARD_OUTPUT_COLUMNS = [
     "error_code",
 ]
 REQUIRED_OUTPUT_COLUMNS = ["email", "confidence_score"]
+UPDATE_PROGRESS_BY_STEP = {
+    "queued": 0.05,
+    "start": 0.1,
+    "stopping_process": 0.18,
+    "downloading_release": 0.32,
+    "extracting_release": 0.45,
+    "applying_files": 0.62,
+    "removing_stale_files": 0.76,
+    "syncing_dependencies": 0.88,
+    "restarting_app": 0.95,
+    "success": 1.0,
+    "failed": 1.0,
+}
 
 INPUT_KEY_TO_OUTPUT_LABEL = {
     "name": "성명",
@@ -211,7 +224,7 @@ def build_json_contract_text(response_keys):
     return "\n".join(lines)
 
 
-def build_task_prompt(payload, selected_output_columns):
+def build_task_prompt(payload, selected_output_columns, user_tweak: str = ""):
     response_keys = build_response_contract(selected_output_columns)
     prompt_input_keys = [k for k in PROMPT_INPUT_KEYS if INPUT_KEY_TO_OUTPUT_LABEL[k] in selected_output_columns]
 
@@ -224,7 +237,7 @@ def build_task_prompt(payload, selected_output_columns):
         input_lines.append("- 입력 없음")
 
     contract_text = build_json_contract_text(response_keys)
-    return (
+    base_prompt = (
         "검색을 통해서 아래 정보를 완성하라.\n"
         "아래 입력 항목만 활용하고, 입력에 없는 항목은 웹 검색으로 보완하라.\n"
         "명시되지 않은 컬럼은 절대 반환하지 마라.\n"
@@ -232,6 +245,15 @@ def build_task_prompt(payload, selected_output_columns):
         f"{contract_text}\n"
         "입력:\n"
         + "\n".join(input_lines)
+    )
+    tweak = (user_tweak or "").strip()
+    if not tweak:
+        return base_prompt
+    return (
+        f"{base_prompt}\n\n"
+        "[추가 지시]\n"
+        f"{tweak}\n"
+        "단, 위 JSON 스키마와 출력 컬럼 제약은 반드시 준수하라."
     )
 
 
@@ -296,6 +318,28 @@ def resolve_api_key(input_key, provider):
     }
     env_var = env_var_map.get(provider, "OPENAI_API_KEY")
     return os.getenv(env_var, "").strip()
+
+
+def estimate_update_progress(state: str, step: str, message: str) -> float:
+    state_norm = (state or "").strip().lower()
+    step_norm = (step or "").strip().lower()
+    message_norm = (message or "").strip().lower()
+
+    if step_norm in UPDATE_PROGRESS_BY_STEP:
+        return UPDATE_PROGRESS_BY_STEP[step_norm]
+    if state_norm in UPDATE_PROGRESS_BY_STEP:
+        return UPDATE_PROGRESS_BY_STEP[state_norm]
+
+    # Backward compatibility: infer progress from status message if step is absent.
+    if "download" in message_norm:
+        return UPDATE_PROGRESS_BY_STEP["downloading_release"]
+    if "extract" in message_norm:
+        return UPDATE_PROGRESS_BY_STEP["extracting_release"]
+    if "sync" in message_norm:
+        return UPDATE_PROGRESS_BY_STEP["syncing_dependencies"]
+    if "restart" in message_norm:
+        return UPDATE_PROGRESS_BY_STEP["restarting_app"]
+    return 0.12 if state_norm == "running" else 0.0
 
 
 def resolve_output_path(raw_output_name):
@@ -398,6 +442,7 @@ def init_state():
         "openai_model": DEFAULT_OPENAI_MODEL,
         "gemini_model": DEFAULT_GEMINI_MODEL,
         "selected_output_columns": STANDARD_OUTPUT_COLUMNS.copy(),
+        "prompt_user_tweak": "",
         "update_repo": os.getenv("APP_REPO", "").strip(),
         "update_check_result": None,
     }
@@ -420,7 +465,16 @@ def render_update_sidebar(project_root: Path):
 
     github_token = os.getenv("GITHUB_TOKEN", "").strip()
 
-    if st.sidebar.button("최신 버전 확인", key="check_update_btn"):
+    runtime_status = read_update_status(project_root) or {}
+    state = (runtime_status.get("state") or "").lower()
+    step = runtime_status.get("step") or ""
+    message = runtime_status.get("message") or ""
+    updated_at = runtime_status.get("updated_at") or ""
+    is_update_running = state in {"queued", "running"}
+
+    if st.sidebar.button(
+        "최신 버전 확인", key="check_update_btn", disabled=is_update_running
+    ):
         repo = st.session_state.update_repo.strip()
         if not repo:
             st.session_state.update_check_result = {
@@ -434,19 +488,18 @@ def render_update_sidebar(project_root: Path):
             )
             st.session_state.update_check_result = status.to_dict()
 
-    runtime_status = read_update_status(project_root)
-    if runtime_status:
-        state = (runtime_status.get("state") or "").lower()
-        message = runtime_status.get("message") or ""
-        updated_at = runtime_status.get("updated_at") or ""
-        if state == "success":
-            st.sidebar.success(f"최근 업데이트 성공: {message}")
-        elif state == "failed":
-            st.sidebar.error(f"최근 업데이트 실패: {message}")
-        elif state in {"queued", "running"}:
-            st.sidebar.info(f"업데이트 상태: {state} ({message})")
-        if updated_at:
-            st.sidebar.caption(f"업데이트 상태 갱신 시각: {updated_at}")
+    if state == "success":
+        st.sidebar.success(f"최근 업데이트 성공: {message}")
+    elif state == "failed":
+        st.sidebar.error(f"최근 업데이트 실패: {message}")
+    elif is_update_running:
+        progress_value = estimate_update_progress(state=state, step=step, message=message)
+        st.sidebar.progress(progress_value)
+        state_label = step or state
+        st.sidebar.info(f"업데이트 진행 중: {state_label} ({message})")
+        st.sidebar.button("업데이트 상태 새로고침", key="refresh_update_status")
+    if updated_at:
+        st.sidebar.caption(f"업데이트 상태 갱신 시각: {updated_at}")
 
     result = st.session_state.update_check_result
     if not result:
@@ -471,9 +524,16 @@ def render_update_sidebar(project_root: Path):
         st.sidebar.success("이미 최신 버전입니다.")
         return
 
+    if is_update_running:
+        st.sidebar.warning("업데이트가 이미 실행 중입니다. 완료 후 다시 시도해주세요.")
+        return
+
     st.sidebar.warning("새 버전이 있습니다.")
-    if st.sidebar.button("업데이트 실행", key="run_update_btn"):
+    if st.sidebar.button("업데이트 실행", key="run_update_btn", disabled=is_update_running):
         try:
+            # Prevent accidental carry-over into prompt task execution.
+            st.session_state.run_requested = False
+            st.session_state.run_confirmed = False
             release = ReleaseInfo(
                 repo=result.get("repo") or st.session_state.update_repo,
                 tag=result.get("latest_tag") or "",
@@ -624,11 +684,21 @@ def main():
         c for c in selected_output_columns if c not in ("status", "error_code")
     ]
 
+    st.sidebar.text_area(
+        "프롬프트 추가 지시문(선택)",
+        key="prompt_user_tweak",
+        height=90,
+        help="기본 프롬프트에 덧붙일 보조 지시입니다. JSON 형식/컬럼 제약은 자동 유지됩니다.",
+        placeholder="예: 한국어 이름 표기는 원문 그대로 유지하고, 불확실하면 confidence_score를 낮춰줘.",
+    )
+
     sample_payload = {k: "" for k in PROMPT_INPUT_KEYS}
     if len(df_processed) > 0:
         sample_payload = extract_input_payload(df_processed.iloc[0], mapping)
 
-    prompt_preview = build_task_prompt(sample_payload, selected_prompt_columns)
+    prompt_preview = build_task_prompt(
+        sample_payload, selected_prompt_columns, st.session_state.prompt_user_tweak
+    )
     st.sidebar.text_area(
         "프롬프트(출력 컬럼 반영)",
         value=prompt_preview,
@@ -683,11 +753,21 @@ def main():
         st.session_state.done_text = ""
 
     if st.session_state.run_requested:
+        def stop_requested(level: str, text: str):
+            st.session_state.run_requested = False
+            if level == "warning":
+                st.warning(text)
+            else:
+                st.error(text)
+
         if not selected_output_columns:
-            st.error("최소 1개 이상의 출력 컬럼을 선택해주세요.")
+            stop_requested("error", "최소 1개 이상의 출력 컬럼을 선택해주세요.")
             return
         if not selected_prompt_columns:
-            st.error("status/error_code만 선택된 상태입니다. 추출할 출력 컬럼을 선택해주세요.")
+            stop_requested(
+                "error",
+                "status/error_code만 선택된 상태입니다. 추출할 출력 컬럼을 선택해주세요.",
+            )
             return
 
         response_keys = build_response_contract(selected_prompt_columns)
@@ -695,21 +775,21 @@ def main():
         provider = st.session_state.provider
         resolved_api_key = resolve_api_key(api_key, provider)
         if not resolved_api_key:
-            st.error(f"API Key를 입력하거나 {env_hint} 환경변수를 설정해주세요.")
+            stop_requested("error", f"API Key를 입력하거나 {env_hint} 환경변수를 설정해주세요.")
             return
 
         if ("회사명" in selected_prompt_columns) and mapping.get("company") is None:
-            st.error("회사명 입력 컬럼을 설정해주세요. (회사명은 필수)")
+            stop_requested("error", "회사명 입력 컬럼을 설정해주세요. (회사명은 필수)")
             return
 
         if not selected_model or not str(selected_model).strip():
-            st.error("모델명을 입력해주세요.")
+            stop_requested("error", "모델명을 입력해주세요.")
             return
 
         try:
             output_path = resolve_output_path(st.session_state.output_name)
         except ValueError as exc:
-            st.error(str(exc))
+            stop_requested("error", str(exc))
             return
 
         partial_path = get_partial_path(output_path)
@@ -722,7 +802,7 @@ def main():
         end = total if int(st.session_state.end) == 0 else min(int(st.session_state.end), total)
 
         if start >= end:
-            st.warning(f"처리할 행이 없습니다. start={start}, end={end}")
+            stop_requested("warning", f"처리할 행이 없습니다. start={start}, end={end}")
             return
 
         subset = df_run.iloc[start:end].copy()
@@ -774,7 +854,9 @@ def main():
             input_payload = extract_input_payload(row, mapping)
 
             try:
-                prompt_text = build_task_prompt(input_payload, selected_prompt_columns)
+                prompt_text = build_task_prompt(
+                    input_payload, selected_prompt_columns, st.session_state.prompt_user_tweak
+                )
                 if provider == "openai":
                     result_payload = get_info_from_openai(client, prompt_text, selected_model)
                 else:

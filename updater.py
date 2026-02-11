@@ -216,10 +216,11 @@ def _powershell_update_script() -> str:
 $ErrorActionPreference = "Stop"
 
 function Write-Status {
-    param([string]$State, [string]$Message)
+    param([string]$State, [string]$Message, [string]$Step = "")
     $obj = @{
         state = $State
         message = $Message
+        step = $Step
         updated_at = (Get-Date).ToString("o")
     }
     $json = $obj | ConvertTo-Json -Depth 4
@@ -260,9 +261,10 @@ try {
     Ensure-Dir -PathValue $TempDir
     Ensure-Dir -PathValue $BackupDir
 
-    Write-Status -State "running" -Message "update script started"
+    Write-Status -State "running" -Message "update script started" -Step "start"
 
     if ($TargetPid -gt 0) {
+        Write-Status -State "running" -Message "stopping current app process" -Step "stopping_process"
         Start-Sleep -Seconds 2
         Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
@@ -277,7 +279,9 @@ try {
     $headers = @{}
     if ($GitHubToken) { $headers["Authorization"] = "Bearer $GitHubToken" }
 
+    Write-Status -State "running" -Message "downloading release archive" -Step "downloading_release"
     Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -Headers $headers -UseBasicParsing
+    Write-Status -State "running" -Message "extracting release archive" -Step "extracting_release"
     Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
     $extractedDirs = Get-ChildItem -Path $extractDir -Directory
@@ -292,6 +296,7 @@ try {
     $excludedFiles = @(".env")
     $excludedGlobs = @("*.csv", "*.xlsx", "*.xls", "*.parquet")
 
+    Write-Status -State "running" -Message "applying release files" -Step "applying_files"
     $sourceFiles = Get-ChildItem -Path $sourceRoot -Recurse -File
     foreach ($src in $sourceFiles) {
         $relative = $src.FullName.Substring($sourceRoot.Length).TrimStart('\\','/')
@@ -317,6 +322,7 @@ try {
         Copy-Item -Path $src.FullName -Destination $dest -Force
     }
 
+    Write-Status -State "running" -Message "removing stale files" -Step "removing_stale_files"
     # Delete stale files that are not present in the new release.
     $workFiles = Get-ChildItem -Path $WorkDir -Recurse -File
     foreach ($wf in $workFiles) {
@@ -337,13 +343,15 @@ try {
         Remove-Item -Path $wf.FullName -Force -ErrorAction Stop
     }
 
+    Write-Status -State "running" -Message "syncing dependencies" -Step "syncing_dependencies"
     Push-Location $WorkDir
     uv sync
     Pop-Location
 
+    Write-Status -State "running" -Message "restarting application" -Step "restarting_app"
     Start-Process -FilePath "uv" -ArgumentList @("run", "main.py") -WorkingDirectory $WorkDir
 
-    Write-Status -State "success" -Message "update completed"
+    Write-Status -State "success" -Message "update completed" -Step "success"
 }
 catch {
     $err = $_.Exception.Message
@@ -366,7 +374,7 @@ catch {
         }
     }
 
-    Write-Status -State "failed" -Message $err
+    Write-Status -State "failed" -Message $err -Step "failed"
 }
 '''
     )
@@ -394,6 +402,7 @@ def launch_update_script(
         {
             "state": "queued",
             "message": f"queued update: {release.tag}",
+            "step": "queued",
             "updated_at": datetime.now().isoformat(),
         },
     )
