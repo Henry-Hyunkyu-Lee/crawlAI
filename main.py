@@ -264,9 +264,8 @@ def init_state():
 def render_update_sidebar(project_root: Path):
     st.sidebar.subheader("소프트웨어 업데이트")
 
-    st.session_state.update_repo = st.sidebar.text_input(
+    st.sidebar.text_input(
         "GitHub Repo (owner/repo)",
-        value=st.session_state.update_repo,
         key="update_repo",
         help="예: your-org/your-repo (또는 https://github.com/your-org/your-repo)",
     )
