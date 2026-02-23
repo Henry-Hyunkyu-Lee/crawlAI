@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -12,7 +13,13 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from updater import ReleaseInfo, check_for_update, launch_update_script, read_update_status
+from updater import (
+    ReleaseInfo,
+    check_for_update,
+    get_local_version,
+    launch_update_script,
+    read_update_status,
+)
 
 DEFAULT_OUTPUT = "results.csv"
 DEFAULT_HEAD_ROWS = 30
@@ -74,6 +81,7 @@ UPDATE_PROGRESS_BY_STEP = {
     "success": 1.0,
     "failed": 1.0,
 }
+UPDATE_STATUS_STALE_SECONDS = 15 * 60
 
 INPUT_KEY_TO_OUTPUT_LABEL = {
     "name": "성명",
@@ -342,6 +350,48 @@ def estimate_update_progress(state: str, step: str, message: str) -> float:
     return 0.12 if state_norm == "running" else 0.0
 
 
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def is_stale_update_runtime(state: str, updated_at: str) -> bool:
+    state_norm = (state or "").strip().lower()
+    if state_norm not in {"queued", "running"}:
+        return False
+
+    timestamp = parse_iso_datetime(updated_at)
+    if not timestamp:
+        return True
+
+    age_seconds = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    return age_seconds > UPDATE_STATUS_STALE_SECONDS
+
+
+def parse_version_tuple(version: str):
+    raw = (version or "").strip()
+    raw = raw.split("-", 1)[0].split("+", 1)[0]
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?$", raw)
+    if not match:
+        raise ValueError(f"unsupported version format: {version}")
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    patch = int(match.group(3) or 0)
+    return (major, minor, patch)
+
+
+def is_update_available_from_versions(local_version: str, latest_version: str) -> bool:
+    return parse_version_tuple(latest_version) > parse_version_tuple(local_version)
+
+
 def resolve_output_path(raw_output_name):
     output_name = (raw_output_name or DEFAULT_OUTPUT).strip()
     if not output_name:
@@ -570,6 +620,148 @@ def render_update_sidebar(project_root: Path):
             st.sidebar.error(f"업데이트 시작 실패: {type(exc).__name__}: {exc}")
 
 
+def render_update_sidebar_v2(project_root: Path):
+    st.sidebar.subheader("소프트웨어 업데이트")
+
+    st.sidebar.text_input(
+        "GitHub Repo (owner/repo)",
+        key="update_repo",
+        help="예: your-org/your-repo 또는 https://github.com/your-org/your-repo",
+    )
+
+    github_token = os.getenv("GITHUB_TOKEN", "").strip()
+    pyproject_path = project_root / "pyproject.toml"
+    status_path = project_root / ".update_runtime" / "update_status.json"
+
+    runtime_status = read_update_status(project_root) or {}
+    state = (runtime_status.get("state") or "").lower()
+    step = runtime_status.get("step") or ""
+    message = runtime_status.get("message") or ""
+    updated_at = runtime_status.get("updated_at") or ""
+    stale_runtime = is_stale_update_runtime(state=state, updated_at=updated_at)
+    is_update_running = state in {"queued", "running"} and not stale_runtime
+
+    if runtime_status and st.sidebar.button("업데이트 상태 초기화", key="reset_update_status_btn_v2"):
+        try:
+            if status_path.exists():
+                status_path.unlink()
+        except OSError as exc:
+            st.sidebar.error(f"상태 파일 초기화 실패: {type(exc).__name__}")
+        else:
+            st.sidebar.success("업데이트 상태를 초기화했습니다.")
+            st.rerun()
+
+    if stale_runtime:
+        st.sidebar.warning(
+            "업데이트 상태가 오래되어 중단된 것으로 판단했습니다. 상태 초기화 후 다시 확인하세요."
+        )
+
+    if st.sidebar.button("최신 버전 확인", key="check_update_btn_v2", disabled=is_update_running):
+        repo = st.session_state.update_repo.strip()
+        if not repo:
+            st.session_state.update_check_result = {
+                "error": "APP_REPO 환경변수 또는 Repo 입력값이 필요합니다."
+            }
+        else:
+            status = check_for_update(
+                repo=repo,
+                pyproject_path=pyproject_path,
+                github_token=github_token,
+            )
+            st.session_state.update_check_result = status.to_dict()
+
+    if state == "success":
+        st.sidebar.success(f"최근 업데이트 성공: {message}")
+    elif state == "failed":
+        st.sidebar.error(f"최근 업데이트 실패: {message}")
+    elif is_update_running:
+        progress_value = estimate_update_progress(state=state, step=step, message=message)
+        st.sidebar.progress(progress_value)
+        state_label = step or state
+        st.sidebar.info(f"업데이트 진행 중: {state_label} ({message})")
+        st.sidebar.button("업데이트 상태 새로고침", key="refresh_update_status_v2")
+    if updated_at:
+        st.sidebar.caption(f"업데이트 상태 갱신 시각: {updated_at}")
+
+    result = st.session_state.update_check_result
+    if not result:
+        return
+
+    live_local_version = None
+    try:
+        live_local_version = get_local_version(pyproject_path)
+    except Exception:
+        pass
+
+    if live_local_version and isinstance(result, dict):
+        cached_local_version = result.get("local_version")
+        if cached_local_version != live_local_version:
+            refreshed = dict(result)
+            refreshed["local_version"] = live_local_version
+            latest_version = refreshed.get("latest_version")
+            if latest_version:
+                try:
+                    refreshed["update_available"] = is_update_available_from_versions(
+                        live_local_version, latest_version
+                    )
+                except Exception:
+                    pass
+            st.session_state.update_check_result = refreshed
+            result = refreshed
+
+    if result.get("error"):
+        st.sidebar.error(result["error"])
+        return
+
+    local_version = live_local_version or result.get("local_version")
+    latest_version = result.get("latest_version")
+    latest_tag = result.get("latest_tag")
+    release_url = result.get("release_url")
+
+    st.sidebar.caption(f"현재 버전: {local_version}")
+    st.sidebar.caption(f"최신 버전: {latest_version} ({latest_tag})")
+
+    if release_url:
+        st.sidebar.markdown(f"[Release Notes]({release_url})")
+
+    if not result.get("update_available"):
+        st.sidebar.success("이미 최신 버전입니다.")
+        return
+
+    if is_update_running:
+        st.sidebar.warning("업데이트가 이미 실행 중입니다. 완료 후 다시 시도해주세요.")
+        return
+
+    st.sidebar.warning("새 버전이 있습니다.")
+    if st.sidebar.button("업데이트 실행", key="run_update_btn_v2", disabled=is_update_running):
+        try:
+            # Prevent accidental carry-over into prompt task execution.
+            st.session_state.run_requested = False
+            st.session_state.run_confirmed = False
+            release = ReleaseInfo(
+                repo=result.get("repo") or st.session_state.update_repo,
+                tag=result.get("latest_tag") or "",
+                version=result.get("latest_version") or "",
+                zip_url=result.get("zip_url") or "",
+                html_url=result.get("release_url") or "",
+                published_at=None,
+            )
+            if not release.zip_url:
+                raise ValueError("zip_url 정보가 없어 업데이트를 실행할 수 없습니다.")
+
+            launch_update_script(
+                release=release,
+                project_root=project_root,
+                current_pid=os.getpid(),
+                github_token=github_token,
+            )
+            st.sidebar.warning(
+                "업데이트를 시작했습니다. 앱이 잠시 종료되거나 재시작될 수 있습니다."
+            )
+        except Exception as exc:
+            st.sidebar.error(f"업데이트 시작 실패: {type(exc).__name__}: {exc}")
+
+
 def main():
     st.set_page_config(page_title="AI Mail Collector", layout="wide")
     st.title("AI Mail Collector (Streamlit UI)")
@@ -578,7 +770,7 @@ def main():
     init_state()
 
     project_root = Path(__file__).resolve().parent
-    render_update_sidebar(project_root)
+    render_update_sidebar_v2(project_root)
 
     st.sidebar.subheader("데이터 불러오기")
     uploaded = st.sidebar.file_uploader("파일 업로드 (csv/xlsx)", type=["csv", "xlsx"])
