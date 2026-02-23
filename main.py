@@ -428,6 +428,7 @@ def merge_input_and_result(input_payload, result_payload):
 def init_state():
     defaults = {
         "df_raw": None,
+        "columns_signature": None,
         "head_rows": DEFAULT_HEAD_ROWS,
         "start": 0,
         "end": 0,
@@ -452,6 +453,17 @@ def init_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def clear_loaded_data_state():
+    st.session_state.df_raw = None
+    st.session_state.columns_signature = None
+    st.session_state.dedupe_cols = []
+    st.session_state.run_requested = False
+    st.session_state.run_confirmed = False
+    st.session_state.done_text = ""
+    for spec in INPUT_FIELD_SPECS:
+        st.session_state[f"map_{spec['key']}_col"] = None
 
 
 def render_update_sidebar(project_root: Path):
@@ -570,6 +582,9 @@ def main():
 
     st.sidebar.subheader("데이터 불러오기")
     uploaded = st.sidebar.file_uploader("파일 업로드 (csv/xlsx)", type=["csv", "xlsx"])
+    if st.sidebar.button("입력 데이터 초기화", key="reset_input_state_btn"):
+        clear_loaded_data_state()
+        st.rerun()
     st.sidebar.number_input(
         "미리보기 행 수",
         min_value=1,
@@ -578,7 +593,10 @@ def main():
         key="head_rows",
     )
 
-    if uploaded is not None:
+    if uploaded is None:
+        if st.session_state.df_raw is not None:
+            clear_loaded_data_state()
+    else:
         try:
             st.session_state.df_raw = load_data(uploaded)
         except Exception as exc:
@@ -821,6 +839,11 @@ def main():
                     st.info(f"partial 재개: {resumed_rows}행은 기존 결과를 사용합니다.")
             except Exception as exc:
                 st.warning(f"partial 파일을 읽지 못해 새로 시작합니다: {type(exc).__name__}")
+
+        if not st.session_state.resume_from_partial:
+            # Ignore carried status/error markers when partial resume is disabled.
+            subset["status"] = ""
+            subset["error_code"] = ""
 
         pending_subset = subset[~subset["status"].isin(RESULT_COMPLETE_STATES)].copy()
         if pending_subset.empty:
