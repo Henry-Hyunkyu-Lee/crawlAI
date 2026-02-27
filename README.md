@@ -1,91 +1,118 @@
-﻿# AI 크롤링 Streamlit UI
+﻿# AI Mail Collector (Streamlit)
 
-Streamlit 기반 UI에서 파일 업로드, 피처 컬럼 선택, 크롤링 실행을 수행합니다.
-`uv run main.py`만으로 Streamlit이 자동 실행되도록 구성되어 있습니다.
+콜드 메일 발송용 이메일 리서치를 위한 Streamlit 앱입니다.
 
-## 요구 사항
-
-- Python 3.10+
-- uv
-
-## uv 설치
-
-공식 설치 가이드: https://docs.astral.sh/uv/
-
-예시(Windows PowerShell):
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-또는 기타 설치 예시:
-```
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-설치 후 확인:
-
-```
-uv --version
-```
-
-## 실행
+## 빠른 시작
 
 ```bash
+uv sync
 uv run main.py
 ```
 
-브라우저가 열리지 않으면 터미널에 표시되는 로컬 URL로 접속하세요.
+필수/선택 환경변수(`.env`):
 
-## 사용 방법
+- `OPENAI_API_KEY` (OpenAI 사용 시)
+- `GEMINI_API_KEY` (Gemini 사용 시)
+- `APP_REPO` (선택, 업데이트 대상 저장소)
+- `GITHUB_TOKEN` (선택, GitHub API 한도 완화)
 
-1. 사이드바에서 CSV/XLSX 파일을 업로드합니다.
-2. `입력 컬럼 설정`에서 표준 필드 매핑을 지정합니다.
-    - 성명, 회사명, 부서명, 직책명, 과제명
-    - 회사명은 필수이며, 없는 필드는 `(없음)`으로 두면 빈값 처리됩니다.
-3. `중복 제거 기준 컬럼`을 선택해 전처리 기준을 설정합니다.
-4. 미리보기에서 데이터 형태를 확인합니다.
-5. 실행 옵션에서 범위/Provider/모델/API Key를 지정합니다.
-6. `출력 컬럼 선택`에서 필요한 컬럼만 선택합니다.
-    - 제외한 컬럼은 프롬프트 요청/모델 응답 계약/최종 저장에서 모두 제외됩니다.
-    - `email`, `confidence_score`는 필수 컬럼으로 항상 포함됩니다.
-7. `프롬프트 태스크 시작` 버튼으로 실행합니다.
+## 핵심 워크플로 (3단계)
 
-## 프롬프트
+### 1) 데이터 준비
 
-- 프롬프트는 선택한 출력 컬럼을 반영해 동적으로 생성됩니다.
-- `프롬프트 추가 지시문(선택)`에 짧은 보조 지시를 입력해 기본 프롬프트를 미세 조정할 수 있습니다.
-- 입력값이 있는 항목은 그대로 사용하고, 빈 항목만 웹검색으로 보완하도록 지시합니다.
-- 모델 응답은 JSON 객체로 강제됩니다.
-- 추가 지시를 넣어도 JSON 형식/선택 컬럼 제약은 유지됩니다.
+사이드바에서 아래 항목을 설정합니다.
 
-## 출력
+- `파일 업로드 (csv/xlsx)`
+- `회사명 입력 컬럼` (필수)
+- `웹사이트/도메인 컬럼 (선택)`
+- `추가 컨텍스트 컬럼 (선택)`
+- `미리보기/프롬프트 갱신` (수동 강제 갱신 버튼)
 
-- 결과는 지정한 출력 파일명으로 저장됩니다.
-- 기본 파일명은 results.csv입니다.
-- 출력 컬럼 기본 목록은 아래와 같고, 실행 시 필요한 컬럼만 선택해 저장할 수 있습니다.
-  - `성명`, `회사명`, `부서명`, `직책명`, `과제명`, `email`, `confidence_score`, `status`, `error_code`
-- `status`/`error_code`는 모델 응답이 아닌 시스템 실행 상태로 기록됩니다.
+### 2) 프롬프트 작성
 
-## 주의 사항
+- 기본 프롬프트는 `test.py`의 `BASE_PROMPT`를 사용합니다.
+- 템플릿 선택 기능은 제공하지 않습니다.
+- 렌더링된 프롬프트는 입력 데이터 기반으로 즉시 확인할 수 있습니다.
 
-- 실행 중 세션이 끊기면 결과가 저장되지 않을 수 있습니다.
-- API Key는 저장되지 않으며 입력값은 노출되지 않도록 주의하세요.
+### 3) 실행 옵션 설정
 
-## 환경변수(.env)
+- `Provider` (`openai` / `gemini`)
+- `Model`
+- `API Key`
+- `시작 인덱스`
+- `종료 인덱스 (0이면 전체)`
+- `출력 파일명`
+- `중간 저장 간격(행)`
+- `partial 파일에서 재개`
 
-- OpenAI: `OPENAI_API_KEY`
-- Gemini: `GEMINI_API_KEY`
-- 업데이트 대상 저장소: `APP_REPO` (예: `owner/repo`)
-- GitHub API 토큰(선택): `GITHUB_TOKEN`
+## 사이드바 파라미터 -> 워크플로 반영 방식
 
-## 소프트웨어 업데이트
+| 파라미터 | 적용 단계 | 코드 반영 위치 | 실제 영향 |
+|---|---|---|---|
+| 파일 업로드 | 1 | `load_data()` -> `df_raw` | 입력 원본 DataFrame 생성 |
+| 회사명 입력 컬럼 | 1 | `mapping['company_col']` -> `extract_input_payload()` | 행별 회사명 입력 구성 |
+| 웹사이트/도메인 컬럼 | 1 | `mapping['domain_col']` -> `extract_input_payload()` | 행별 도메인 입력 구성 |
+| 추가 컨텍스트 컬럼 | 1 | `mapping['context_cols']` -> `extract_input_payload()` | 행별 컨텍스트 문자열 구성 |
+| 프롬프트 | 2 | `st.session_state.prompt_template` -> `build_prompt_text()` | 모델 입력 프롬프트 본문 생성 |
+| Provider | 3 | `get_info_from_openai()` 또는 `get_info_from_gemini()` | API 호출 경로 결정 |
+| Model | 3 | `model_name` | 모델 식별자 결정 |
+| API Key | 3 | `resolve_api_key()` | 인증 토큰 결정 |
+| 시작/종료 인덱스 | 3 | `run_workflow()`의 `start_idx/end_idx` | 처리 범위 결정 |
+| 출력 파일명 | 3 | `resolve_output_path()` | 저장 경로 결정 |
+| 중간 저장 간격 | 3 | `autosave_every` -> `save_partial()` | N행마다 partial 저장 |
+| partial 재개 | 3 | `merge_partial_results()` | 완료 행 재사용 후 나머지 처리 |
 
-1. 사이드바의 `소프트웨어 업데이트` 섹션에서 `GitHub Repo (owner/repo)`를 입력합니다.
-2. `최신 버전 확인`을 눌러 현재 버전과 최신 릴리즈 버전을 비교합니다.
-3. 새 버전이 있으면 `업데이트 실행` 버튼이 활성화됩니다.
-4. 업데이트 실행 시 백업 후 최신 소스를 반영하고, 신버전에 없는 오래된 파일을 자동 삭제한 뒤 `uv sync` 후 앱을 재실행합니다.
-5. 업데이트 실행 중에는 `업데이트 실행`/`최신 버전 확인` 버튼이 잠기며, 사이드바에 단계별 상태와 진행률이 표시됩니다.
-6. 진행 상태는 `업데이트 상태 새로고침` 버튼으로 수동 갱신할 수 있습니다.
+## 결과 파일 (원문 보존형)
 
-업데이트 버튼을 누를 때는 프롬프트 태스크 실행 플래그를 즉시 초기화하여, 업데이트와 데이터 추론 태스크가 동시에 트리거되지 않도록 분리했습니다.
+최종 CSV는 아래 컬럼을 저장합니다.
+
+- `input_company`
+- `input_domain`
+- `input_context`
+- `response_id`
+- `response_text`
+- `source_urls`
+- `response_json`
+- `error`
+
+## 앱 업데이트 (GitHub Release)
+
+업데이트 UI는 사이드바 하단에 있습니다.
+
+- `최신 버전 확인`
+- `상태 새로고침`
+- `업데이트 실행`
+- `stale 상태 초기화` (상태 파일이 오래되어 실행 중으로 보일 때)
+
+### 업데이트 상태 필드
+
+업데이트 런타임 상태(`.update_runtime/update_status.json`)는 아래 필드를 사용합니다.
+
+- `run_id`: 실행 식별자
+- `state`: `queued` / `running` / `success` / `failed`
+- `step`: 세부 단계 (`downloading_release`, `syncing_dependencies` 등)
+- `progress`: 0.0~1.0 진행률
+- `message`: 상태 메시지
+- `error_code`: 실패 분류 코드 (`AUTH_ERROR`, `NETWORK_ERROR`, `FS_ERROR`, `DEPENDENCY_ERROR`, `UNKNOWN_ERROR`)
+- `error_hint`: 사용자 조치 가이드
+- `started_at`, `finished_at`, `updated_at`
+
+### 실패 시 동작
+
+- 파일 교체 실패 시 백업 복원 시도
+- 새로 생성된 파일 정리 시도
+- 상태 파일에 실패 코드/힌트 기록
+- 업데이트 락(`.update_runtime/update.lock`) 해제
+
+## 스모크 체크
+
+```bash
+uv run python -c "import main, updater; print('IMPORT_OK')"
+uv run main.py
+```
+
+## 테스트
+
+```bash
+python -m pytest -q
+```

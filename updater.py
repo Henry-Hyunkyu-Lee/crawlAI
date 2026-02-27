@@ -1,11 +1,12 @@
 import json
+import os
 import re
 import subprocess
 import textwrap
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -13,6 +14,7 @@ GITHUB_API_BASE = "https://api.github.com"
 UPDATE_RUNTIME_DIR = ".update_runtime"
 UPDATE_BACKUP_DIR = ".update_backups"
 UPDATE_STATUS_FILE = "update_status.json"
+UPDATE_LOCK_FILE = "update.lock"
 
 
 @dataclass
@@ -47,10 +49,14 @@ class UpdateLaunchResult:
     backup_dir: Path
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def normalize_repo(repo: str) -> str:
     value = (repo or "").strip()
     if not value:
-        return ""
+        raise ValueError("repository 값이 비어 있습니다. owner/repo 형식이어야 합니다.")
 
     value = value.replace("\\", "/")
     if value.startswith("https://github.com/"):
@@ -88,10 +94,29 @@ def get_local_version(pyproject_path: Path) -> str:
 
 
 def _github_headers(github_token: str):
-    headers = {"Accept": "application/vnd.github+json"}
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
     return headers
+
+
+def _extract_github_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "").strip()
+            if message:
+                return message
+    except Exception:
+        pass
+
+    text = str(getattr(response, "text", "") or "").strip()
+    if text:
+        return text[:200]
+    return "unknown error"
 
 
 def get_latest_release(repo: str, github_token: str = "", timeout: int = 20) -> ReleaseInfo:
@@ -101,8 +126,14 @@ def get_latest_release(repo: str, github_token: str = "", timeout: int = 20) -> 
 
     if response.status_code == 404:
         raise ValueError("해당 저장소의 latest release를 찾을 수 없습니다.")
+    if response.status_code == 401:
+        raise ValueError("GitHub 인증에 실패했습니다. GITHUB_TOKEN 권한을 확인하세요.")
     if response.status_code == 403:
-        raise ValueError("GitHub API 요청이 제한되었습니다. GITHUB_TOKEN을 설정하세요.")
+        details = _extract_github_error_message(response)
+        raise ValueError(f"GitHub API 요청이 제한되었습니다. {details}")
+    if response.status_code >= 400:
+        details = _extract_github_error_message(response)
+        raise ValueError(f"GitHub API 오류({response.status_code}): {details}")
 
     response.raise_for_status()
     payload = response.json()
@@ -183,22 +214,141 @@ def get_status_path(project_root: Path) -> Path:
     return runtime_dir / UPDATE_STATUS_FILE
 
 
+def get_lock_path(project_root: Path) -> Path:
+    runtime_dir = project_root / UPDATE_RUNTIME_DIR
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir / UPDATE_LOCK_FILE
+
+
+def classify_update_error(message: str) -> Tuple[str, str]:
+    text = str(message or "").strip().lower()
+    if not text:
+        return ("UNKNOWN_ERROR", "오류 메시지가 없습니다. 상태 파일을 새로고침 후 다시 시도하세요.")
+
+    if any(token in text for token in ["401", "403", "token", "bad credentials", "unauthorized"]):
+        return ("AUTH_ERROR", "GITHUB_TOKEN 또는 저장소 접근 권한을 확인한 뒤 다시 시도하세요.")
+    if any(token in text for token in ["timeout", "timed out", "connection", "download", "invoke-webrequest"]):
+        return ("NETWORK_ERROR", "네트워크 상태를 확인한 뒤 업데이트를 다시 시도하세요.")
+    if any(token in text for token in ["access is denied", "permission", "used by another process", "cannot find path"]):
+        return ("FS_ERROR", "앱/파일 점유를 해제하고 관리자 권한으로 다시 시도하세요.")
+    if any(token in text for token in ["uv sync", "dependency", "module", "pip", "importerror"]):
+        return ("DEPENDENCY_ERROR", "의존성 동기화에 실패했습니다. `uv sync`를 수동 실행해 확인하세요.")
+    return ("UNKNOWN_ERROR", "오류 메시지를 확인하고 환경을 점검한 뒤 다시 시도하세요.")
+
+
+def read_update_lock(project_root: Path) -> Optional[Dict[str, Any]]:
+    lock_path = get_lock_path(project_root)
+    if not lock_path.exists():
+        return None
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def acquire_update_lock(project_root: Path, run_id: str, force: bool = False) -> Path:
+    lock_path = get_lock_path(project_root)
+    if force and lock_path.exists():
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+    payload = {
+        "run_id": str(run_id or "").strip(),
+        "created_at": _utc_now_iso(),
+        "pid": os.getpid(),
+    }
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+    except FileExistsError as exc:
+        active = read_update_lock(project_root) or {}
+        active_run_id = str(active.get("run_id") or "").strip()
+        suffix = f" (active_run_id={active_run_id})" if active_run_id else ""
+        raise RuntimeError(f"업데이트가 이미 실행 중입니다{suffix}.") from exc
+
+    return lock_path
+
+
+def release_update_lock(project_root: Path, run_id: str = "") -> None:
+    lock_path = get_lock_path(project_root)
+    if not lock_path.exists():
+        return
+
+    if run_id:
+        active = read_update_lock(project_root) or {}
+        active_run_id = str(active.get("run_id") or "").strip()
+        if active_run_id and active_run_id != str(run_id).strip():
+            return
+
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+def reset_update_runtime(project_root: Path) -> None:
+    status_path = get_status_path(project_root)
+    lock_path = get_lock_path(project_root)
+    for path in (status_path, lock_path):
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def read_update_status(project_root: Path):
     status_path = get_status_path(project_root)
     if not status_path.exists():
         return None
 
     try:
-        return json.loads(status_path.read_text(encoding="utf-8"))
+        raw = status_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            raw = status_path.read_text(encoding="utf-8-sig")
+        except Exception:
+            return None
     except Exception:
         return None
+
+    if raw.startswith("\ufeff"):
+        raw = raw.lstrip("\ufeff")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def write_update_status(project_root: Path, status: dict):
     status_path = get_status_path(project_root)
-    status_path.write_text(
-        json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+    prev = read_update_status(project_root) or {}
+    payload: Dict[str, Any] = dict(prev)
+    payload.update(dict(status or {}))
+    payload["updated_at"] = _utc_now_iso()
+
+    if "progress" in payload:
+        try:
+            progress = float(payload["progress"])
+            payload["progress"] = min(1.0, max(0.0, progress))
+        except (TypeError, ValueError):
+            payload.pop("progress", None)
+
+    temp_path = status_path.with_name(f"{status_path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    temp_path.replace(status_path)
 
 
 def _powershell_update_script() -> str:
@@ -209,6 +359,8 @@ def _powershell_update_script() -> str:
     [Parameter(Mandatory=$true)][string]$BackupDir,
     [Parameter(Mandatory=$true)][string]$TempDir,
     [Parameter(Mandatory=$true)][string]$StatusPath,
+    [Parameter(Mandatory=$true)][string]$RunId,
+    [Parameter(Mandatory=$true)][string]$LockPath,
     [int]$TargetPid = 0,
     [string]$GitHubToken = ""
 )
@@ -216,13 +368,47 @@ def _powershell_update_script() -> str:
 $ErrorActionPreference = "Stop"
 
 function Write-Status {
-    param([string]$State, [string]$Message, [string]$Step = "")
-    $obj = @{
-        state = $State
-        message = $Message
-        step = $Step
-        updated_at = (Get-Date).ToString("o")
+    param(
+        [string]$State,
+        [string]$Message,
+        [string]$Step = "",
+        [double]$Progress = -1,
+        [string]$ErrorCode = "",
+        [string]$ErrorHint = "",
+        [string]$FinishedAt = ""
+    )
+
+    $obj = @{}
+    if (Test-Path $StatusPath) {
+        try {
+            $existing = Get-Content -Path $StatusPath -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($existing -ne $null) {
+                $existing.PSObject.Properties | ForEach-Object { $obj[$_.Name] = $_.Value }
+            }
+        } catch {}
     }
+
+    $obj["run_id"] = $RunId
+    $obj["state"] = $State
+    $obj["message"] = $Message
+    $obj["step"] = $Step
+    $obj["updated_at"] = (Get-Date).ToString("o")
+    if (-not $obj.ContainsKey("started_at")) {
+        $obj["started_at"] = $obj["updated_at"]
+    }
+    if ($Progress -ge 0) {
+        $obj["progress"] = [Math]::Min(1.0, [Math]::Max(0.0, $Progress))
+    }
+    if ($ErrorCode) {
+        $obj["error_code"] = $ErrorCode
+    }
+    if ($ErrorHint) {
+        $obj["error_hint"] = $ErrorHint
+    }
+    if ($FinishedAt) {
+        $obj["finished_at"] = $FinishedAt
+    }
+
     $json = $obj | ConvertTo-Json -Depth 4
     Set-Content -Path $StatusPath -Value $json -Encoding UTF8
 }
@@ -254,6 +440,24 @@ function Is-Excluded {
     return $false
 }
 
+function Classify-Error {
+    param([string]$Message)
+    $m = ($Message | Out-String).ToLowerInvariant()
+    if ($m -match "401|403|token|bad credentials|unauthorized") {
+        return @("AUTH_ERROR", "GITHUB_TOKEN 또는 저장소 권한을 확인한 뒤 다시 시도하세요.")
+    }
+    if ($m -match "timeout|timed out|connection|download|invoke-webrequest") {
+        return @("NETWORK_ERROR", "네트워크 상태를 확인한 뒤 업데이트를 다시 시도하세요.")
+    }
+    if ($m -match "access is denied|permission|used by another process|cannot find path") {
+        return @("FS_ERROR", "파일 점유를 해제하거나 관리자 권한으로 다시 시도하세요.")
+    }
+    if ($m -match "uv sync|dependency|module|importerror|health check") {
+        return @("DEPENDENCY_ERROR", "의존성 또는 앱 실행 검증에 실패했습니다. `uv sync` 후 재시도하세요.")
+    }
+    return @("UNKNOWN_ERROR", "오류 메시지를 확인하고 환경을 점검한 뒤 다시 시도하세요.")
+}
+
 $newFiles = New-Object System.Collections.Generic.List[string]
 $sourceRelativeSet = @{}
 
@@ -261,10 +465,10 @@ try {
     Ensure-Dir -PathValue $TempDir
     Ensure-Dir -PathValue $BackupDir
 
-    Write-Status -State "running" -Message "update script started" -Step "start"
+    Write-Status -State "running" -Message "update script started" -Step "start" -Progress 0.1
 
     if ($TargetPid -gt 0) {
-        Write-Status -State "running" -Message "stopping current app process" -Step "stopping_process"
+        Write-Status -State "running" -Message "stopping current app process" -Step "stopping_process" -Progress 0.18
         Start-Sleep -Seconds 2
         Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
@@ -279,9 +483,9 @@ try {
     $headers = @{}
     if ($GitHubToken) { $headers["Authorization"] = "Bearer $GitHubToken" }
 
-    Write-Status -State "running" -Message "downloading release archive" -Step "downloading_release"
+    Write-Status -State "running" -Message "downloading release archive" -Step "downloading_release" -Progress 0.32
     Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -Headers $headers -UseBasicParsing
-    Write-Status -State "running" -Message "extracting release archive" -Step "extracting_release"
+    Write-Status -State "running" -Message "extracting release archive" -Step "extracting_release" -Progress 0.45
     Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
     $extractedDirs = Get-ChildItem -Path $extractDir -Directory
@@ -296,7 +500,7 @@ try {
     $excludedFiles = @(".env")
     $excludedGlobs = @("*.csv", "*.xlsx", "*.xls", "*.parquet")
 
-    Write-Status -State "running" -Message "applying release files" -Step "applying_files"
+    Write-Status -State "running" -Message "applying release files" -Step "applying_files" -Progress 0.62
     $sourceFiles = Get-ChildItem -Path $sourceRoot -Recurse -File
     foreach ($src in $sourceFiles) {
         $relative = $src.FullName.Substring($sourceRoot.Length).TrimStart('\\','/')
@@ -322,7 +526,7 @@ try {
         Copy-Item -Path $src.FullName -Destination $dest -Force
     }
 
-    Write-Status -State "running" -Message "removing stale files" -Step "removing_stale_files"
+    Write-Status -State "running" -Message "removing stale files" -Step "removing_stale_files" -Progress 0.76
     # Delete stale files that are not present in the new release.
     $workFiles = Get-ChildItem -Path $WorkDir -Recurse -File
     foreach ($wf in $workFiles) {
@@ -343,15 +547,19 @@ try {
         Remove-Item -Path $wf.FullName -Force -ErrorAction Stop
     }
 
-    Write-Status -State "running" -Message "syncing dependencies" -Step "syncing_dependencies"
+    Write-Status -State "running" -Message "syncing dependencies" -Step "syncing_dependencies" -Progress 0.88
     Push-Location $WorkDir
     uv sync
+    & uv run python -c "import main, updater"
+    if ($LASTEXITCODE -ne 0) {
+        throw "health check failed after update"
+    }
     Pop-Location
 
-    Write-Status -State "running" -Message "restarting application" -Step "restarting_app"
+    Write-Status -State "running" -Message "restarting application" -Step "restarting_app" -Progress 0.95
     Start-Process -FilePath "uv" -ArgumentList @("run", "main.py") -WorkingDirectory $WorkDir
 
-    Write-Status -State "success" -Message "update completed" -Step "success"
+    Write-Status -State "success" -Message "update completed" -Step "success" -Progress 1.0 -FinishedAt (Get-Date).ToString("o")
 }
 catch {
     $err = $_.Exception.Message
@@ -374,7 +582,15 @@ catch {
         }
     }
 
-    Write-Status -State "failed" -Message $err -Step "failed"
+    $classified = Classify-Error -Message $err
+    $code = $classified[0]
+    $hint = $classified[1]
+    Write-Status -State "failed" -Message $err -Step "failed" -Progress 1.0 -ErrorCode $code -ErrorHint $hint -FinishedAt (Get-Date).ToString("o")
+}
+finally {
+    if (Test-Path $LockPath) {
+        Remove-Item -Path $LockPath -Force -ErrorAction SilentlyContinue
+    }
 }
 '''
     )
@@ -386,10 +602,21 @@ def launch_update_script(
     current_pid: int,
     github_token: str = "",
 ) -> UpdateLaunchResult:
+    normalized_repo = normalize_repo(release.repo)
+    if not str(release.tag or "").strip():
+        raise ValueError("release tag가 비어 있습니다.")
+    if not str(release.version or "").strip():
+        raise ValueError("release version이 비어 있습니다.")
+    zip_url = str(release.zip_url or "").strip()
+    if not zip_url or not zip_url.lower().startswith("https://"):
+        raise ValueError("release zip_url은 https URL이어야 합니다.")
+
     runtime_dir = project_root / UPDATE_RUNTIME_DIR
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"{timestamp}_{os.getpid()}"
+    lock_path = acquire_update_lock(project_root, run_id=run_id, force=False)
     backup_dir = project_root / UPDATE_BACKUP_DIR / timestamp
     temp_dir = runtime_dir / f"tmp_{timestamp}"
     status_path = runtime_dir / UPDATE_STATUS_FILE
@@ -400,10 +627,17 @@ def launch_update_script(
     write_update_status(
         project_root,
         {
+            "run_id": run_id,
             "state": "queued",
             "message": f"queued update: {release.tag}",
             "step": "queued",
-            "updated_at": datetime.now().isoformat(),
+            "progress": 0.05,
+            "repo": normalized_repo,
+            "target_tag": release.tag,
+            "target_version": release.version,
+            "started_at": _utc_now_iso(),
+            "error_code": "",
+            "error_hint": "",
         },
     )
 
@@ -415,7 +649,7 @@ def launch_update_script(
         "-File",
         str(script_path),
         "-ZipUrl",
-        release.zip_url,
+        zip_url,
         "-WorkDir",
         str(project_root),
         "-BackupDir",
@@ -424,6 +658,10 @@ def launch_update_script(
         str(temp_dir),
         "-StatusPath",
         str(status_path),
+        "-RunId",
+        run_id,
+        "-LockPath",
+        str(lock_path),
         "-TargetPid",
         str(current_pid),
     ]
@@ -436,12 +674,16 @@ def launch_update_script(
     if hasattr(subprocess, "DETACHED_PROCESS"):
         creationflags |= subprocess.DETACHED_PROCESS
 
-    subprocess.Popen(
-        cmd,
-        cwd=str(project_root),
-        close_fds=True,
-        creationflags=creationflags,
-    )
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(project_root),
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    except Exception:
+        release_update_lock(project_root, run_id=run_id)
+        raise
 
     return UpdateLaunchResult(
         script_path=script_path,
